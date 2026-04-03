@@ -22,7 +22,7 @@ export default function Home() {
               Match Predictions
             </h2>
             <p className="mt-1 text-sm text-slate-400">
-              AI-generated probabilities for upcoming fixtures across Europe's
+              AI-generated probabilities for upcoming fixtures across Europe&apos;s
               top 5 leagues
             </p>
           </div>
