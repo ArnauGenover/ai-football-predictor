@@ -44,6 +44,16 @@ services:
     profiles:
       - collect
 
+  scripts:
+    build:
+      context: ./scripts
+      dockerfile: Dockerfile
+    volumes:
+      - ./scripts:/scripts
+      - ./collector/.env:/scripts/.env:ro
+    profiles:
+      - scripts
+
   ml-train:
     build:
       context: ./ml

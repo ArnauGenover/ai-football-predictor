@@ -2,10 +2,11 @@
 Football data collection pipeline.
 Runs from GitHub Actions twice daily. Respects 100 req/day API-Football limit.
 
-Budget per run (5 leagues):
-  - 5 fixture calls (one per league, covers past 7 days + next 21 days)
-  - N odds calls (only for NS matches within 48 hours)
-  - Worst case ~25 total calls → 50/day with 2 runs → well under 100
+Strategy:
+  - Try CURRENT_SEASON first (e.g. 2025 for the 25/26 season)
+  - If the API rejects it (free tier: 2022-2024), fall back to FALLBACK_SEASON
+  - Fetch ALL fixtures for each league (no date filter)
+  - Only fetch odds for NS matches within 48 hours
 """
 
 import os
@@ -37,7 +38,8 @@ HEADERS = {
 TARGET_LEAGUES = [
     int(x) for x in os.getenv("TARGET_LEAGUE_IDS", "39,140,135,78,61").split(",")
 ]
-CURRENT_SEASON = int(os.getenv("CURRENT_SEASON", "2024"))
+CURRENT_SEASON = int(os.getenv("CURRENT_SEASON", "2025"))
+FALLBACK_SEASON = int(os.getenv("FALLBACK_SEASON", "2024"))
 
 DATABASE_URL = os.getenv("DATABASE_URL_SYNC")
 HF_SPACE_URL = os.getenv("HF_SPACE_URL", "")
@@ -55,15 +57,14 @@ def get_engine():
 def api_get(endpoint: str, params: dict) -> dict:
     """Central API caller with debug logging."""
     url = f"{BASE_URL}/{endpoint}"
-    logger.info("  API → GET /%s  params=%s", endpoint, params)
+    logger.info("  API -> GET /%s  params=%s", endpoint, params)
     response = requests.get(url, headers=HEADERS, params=params)
     response.raise_for_status()
     data = response.json()
 
     results_count = len(data.get("response", []))
     errors = data.get("errors", {})
-    remaining = data.get("paging", {}).get("total", "?")
-    logger.info("  API ← %d results (total pages: %s)", results_count, remaining)
+    logger.info("  API <- %d results", results_count)
 
     if errors:
         logger.warning("  API errors: %s", errors)
@@ -71,11 +72,24 @@ def api_get(endpoint: str, params: dict) -> dict:
     return data
 
 
-def fetch_fixtures(league_id: int, season: int) -> list:
-    """Fetches ALL fixtures for a league+season (no date filter)."""
+def fetch_fixtures(league_id: int, season: int) -> tuple[list, int]:
+    """
+    Fetch fixtures for league+season. Returns (fixtures_list, actual_season_used).
+    Falls back to FALLBACK_SEASON if the primary season is blocked by the API plan.
+    """
     params = {"league": league_id, "season": season}
     data = api_get("fixtures", params)
-    return data.get("response", [])
+
+    errors = data.get("errors", {})
+    is_plan_error = any("plan" in str(v).lower() for v in errors.values()) if errors else False
+
+    if is_plan_error and season != FALLBACK_SEASON:
+        logger.warning("  Season %d blocked by API plan — falling back to %d", season, FALLBACK_SEASON)
+        params["season"] = FALLBACK_SEASON
+        data = api_get("fixtures", params)
+        return data.get("response", []), FALLBACK_SEASON
+
+    return data.get("response", []), season
 
 
 def fetch_match_odds(fixture_id: int) -> list:
@@ -125,24 +139,30 @@ INSERT_ODDS_SQL = text("""
 
 
 def run_pipeline():
-    logger.info("Starting data collection pipeline...")
-    logger.info("Season: %d | Leagues: %s", CURRENT_SEASON, TARGET_LEAGUES)
+    logger.info("=" * 60)
+    logger.info("Starting data collection pipeline")
+    logger.info("Primary season: %d | Fallback: %d | Leagues: %s",
+                CURRENT_SEASON, FALLBACK_SEASON, TARGET_LEAGUES)
+    logger.info("=" * 60)
     engine = get_engine()
     api_call_count = 0
     now = datetime.now(timezone.utc)
     total_fixtures = 0
+    ns_count = 0
 
     with engine.begin() as conn:
         for league in TARGET_LEAGUES:
-            logger.info("── League %s (season %s) ──", league, CURRENT_SEASON)
-            fixtures = fetch_fixtures(league, CURRENT_SEASON)
+            logger.info("── League %s ──", league)
+            fixtures, actual_season = fetch_fixtures(league, CURRENT_SEASON)
             api_call_count += 1
+            if actual_season != CURRENT_SEASON:
+                api_call_count += 1
 
             if not fixtures:
-                logger.warning("  No fixtures returned for league %s — skipping", league)
+                logger.warning("  No fixtures returned — skipping")
                 continue
 
-            logger.info("  Processing %d fixtures...", len(fixtures))
+            logger.info("  Processing %d fixtures (season %d)...", len(fixtures), actual_season)
 
             for item in fixtures:
                 fixture_data = item["fixture"]
@@ -151,7 +171,6 @@ def run_pipeline():
                 fixture_id = fixture_data["id"]
                 total_fixtures += 1
 
-                # Upsert Teams
                 for side in ("home", "away"):
                     team = teams_data[side]
                     conn.execute(UPSERT_TEAM_SQL, {
@@ -160,12 +179,11 @@ def run_pipeline():
                         "logo_url": team.get("logo"),
                     })
 
-                # Upsert Fixture
                 venue_info = fixture_data.get("venue") or {}
                 conn.execute(UPSERT_FIXTURE_SQL, {
                     "id": fixture_id,
                     "league_id": league,
-                    "season": CURRENT_SEASON,
+                    "season": actual_season,
                     "date": fixture_data["date"],
                     "home_team_id": teams_data["home"]["id"],
                     "away_team_id": teams_data["away"]["id"],
@@ -174,7 +192,6 @@ def run_pipeline():
                     "referee": fixture_data.get("referee"),
                 })
 
-                # Upsert Result if match is finished
                 status = fixture_data["status"]["short"]
                 if status == "FT" and goals_data.get("home") is not None:
                     conn.execute(UPSERT_RESULT_SQL, {
@@ -183,7 +200,9 @@ def run_pipeline():
                         "away_goals": goals_data["away"],
                     })
 
-                # Fetch & insert odds (48-hour window, upcoming only)
+                if status == "NS":
+                    ns_count += 1
+
                 match_date = datetime.fromisoformat(
                     fixture_data["date"].replace("Z", "+00:00")
                 )
@@ -225,7 +244,7 @@ def run_pipeline():
                                     "away_win": values.get("Away", 0),
                                 })
                                 logger.info(
-                                    "    Odds saved: H=%.2f  D=%.2f  A=%.2f",
+                                    "    Odds: H=%.2f  D=%.2f  A=%.2f",
                                     values.get("Home", 0),
                                     values.get("Draw", 0),
                                     values.get("Away", 0),
@@ -233,16 +252,25 @@ def run_pipeline():
 
                     time.sleep(6.5)
 
-    logger.info("Processed %d total fixtures across %d leagues", total_fixtures, len(TARGET_LEAGUES))
+    logger.info("=" * 60)
+    logger.info("Processed %d fixtures (%d NS upcoming)", total_fixtures, ns_count)
 
-    # Verify data was persisted
     with engine.connect() as verify_conn:
         team_count = verify_conn.execute(text("SELECT COUNT(*) FROM teams")).scalar()
         fixture_count = verify_conn.execute(text("SELECT COUNT(*) FROM fixtures")).scalar()
         result_count = verify_conn.execute(text("SELECT COUNT(*) FROM results")).scalar()
-        logger.info("DB totals — teams: %d, fixtures: %d, results: %d", team_count, fixture_count, result_count)
+        ns_db = verify_conn.execute(text("SELECT COUNT(*) FROM fixtures WHERE status = 'NS'")).scalar()
+        logger.info("DB totals — teams: %d, fixtures: %d, results: %d, upcoming(NS): %d",
+                     team_count, fixture_count, result_count, ns_db)
 
-    # Ping Hugging Face Space to prevent sleep
+    if ns_count == 0:
+        logger.warning(
+            "No upcoming (NS) fixtures found. Your API plan (free tier) "
+            "only covers seasons 2022-2024, which are all finished. "
+            "Upgrade to a paid plan for live 2025/26 data, or use "
+            "'python seed_upcoming.py' in the /ml directory to generate demo predictions."
+        )
+
     if HF_SPACE_URL:
         try:
             resp = requests.get(f"{HF_SPACE_URL}/health", timeout=15)
@@ -250,10 +278,8 @@ def run_pipeline():
         except Exception as exc:
             logger.warning("HF Space ping failed: %s", exc)
 
-    logger.info(
-        "Pipeline finished. API calls this run: %d / 100 daily budget",
-        api_call_count,
-    )
+    logger.info("Pipeline finished. API calls: %d / 100 daily budget", api_call_count)
+    logger.info("=" * 60)
 
 
 if __name__ == "__main__":
